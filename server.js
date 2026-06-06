@@ -1,5 +1,7 @@
 require("dotenv").config();
 
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -13,27 +15,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 const WA_SESSION_ID = process.env.WA_SESSION_ID || "main-session";
+const SESSION_PATH = path.join(__dirname, "sessions");
+const SESSION_CLIENT_PATH = path.join(SESSION_PATH, `session-${WA_SESSION_ID}`);
 
+let client = null;
 let isReady = false;
+let isInitializing = false;
 let lastQr = null;
-let lastQrImage = null;
+let lastQrSvg = null;
 let lastQrGeneratedAt = null;
 let clientInfo = null;
-
-const client = new Client({
-  authStrategy: new LocalAuth({
-    clientId: WA_SESSION_ID,
-    dataPath: "./sessions",
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-    ],
-  },
-});
+let lastError = null;
 
 function formatNumber(number) {
   let phone = String(number).replace(/\D/g, "");
@@ -49,67 +41,188 @@ function formatNumber(number) {
   return `${phone}@c.us`;
 }
 
-client.on("qr", async (qr) => {
-  isReady = false;
-  clientInfo = null;
+function formatLogTime() {
+  return new Date().toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    hour12: false,
+  });
+}
 
-  lastQr = qr;
-  lastQrGeneratedAt = new Date().toISOString();
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resetRuntimeState() {
+  isReady = false;
+  lastQr = null;
+  lastQrSvg = null;
+  lastQrGeneratedAt = null;
+  clientInfo = null;
+}
+
+function createClient() {
+  const waClient = new Client({
+    authStrategy: new LocalAuth({
+      clientId: WA_SESSION_ID,
+      dataPath: SESSION_PATH,
+    }),
+    puppeteer: {
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+      ],
+    },
+  });
+
+  waClient.on("qr", async (qr) => {
+    isReady = false;
+    isInitializing = false;
+    clientInfo = null;
+    lastError = null;
+
+    lastQr = qr;
+    lastQrGeneratedAt = new Date().toISOString();
+
+    try {
+      lastQrSvg = await qrcodeImage.toString(qr, {
+        type: "svg",
+        margin: 2,
+        width: 280,
+      });
+    } catch (error) {
+      lastQrSvg = null;
+      lastError = error.message;
+      console.error(`[${formatLogTime()}] Gagal generate QR SVG:`, error.message);
+    }
+
+    console.log(`[${formatLogTime()}] Scan QR ini:`);
+    qrcodeTerminal.generate(qr, { small: true });
+  });
+
+  waClient.on("authenticated", () => {
+    lastError = null;
+    console.log(`[${formatLogTime()}] WhatsApp authenticated`);
+  });
+
+  waClient.on("auth_failure", (message) => {
+    isReady = false;
+    isInitializing = false;
+    clientInfo = null;
+    lastError = message;
+
+    console.error(`[${formatLogTime()}] WhatsApp auth failure:`, message);
+  });
+
+  waClient.on("ready", () => {
+    isReady = true;
+    isInitializing = false;
+    lastQr = null;
+    lastQrSvg = null;
+    lastQrGeneratedAt = null;
+    clientInfo = waClient.info;
+    lastError = null;
+
+    console.log(`[${formatLogTime()}] WhatsApp siap digunakan!`);
+  });
+
+  waClient.on("message", async (msg) => {
+    console.log(`[${formatLogTime()}] Pesan masuk: ${msg.from} ${msg.body}`);
+
+    if (msg.body === "!ping") {
+      const replyText = "Kamu jelek 🤪";
+      const replyMessage = await msg.reply(replyText);
+
+      console.log(
+        `[${formatLogTime()}] Pesan keluar: ${replyMessage.from} -> ${replyMessage.to} ${replyMessage.body}`
+      );
+    }
+  });
+
+  waClient.on("disconnected", (reason) => {
+    isReady = false;
+    isInitializing = false;
+    clientInfo = null;
+    lastError = reason;
+
+    console.log(`[${formatLogTime()}] WhatsApp disconnected:`, reason);
+  });
+
+  waClient.on("change_state", (state) => {
+    console.log(`[${formatLogTime()}] WhatsApp state:`, state);
+  });
+
+  return waClient;
+}
+
+async function initializeClient() {
+  if (isInitializing) {
+    return;
+  }
+
+  if (client) {
+    return;
+  }
 
   try {
-    lastQrImage = await qrcodeImage.toDataURL(qr);
+    isInitializing = true;
+    resetRuntimeState();
+    lastError = null;
+
+    client = createClient();
+
+    await client.initialize();
   } catch (error) {
-    console.error("Gagal generate QR image:", error.message);
-    lastQrImage = null;
+    isReady = false;
+    isInitializing = false;
+    lastError = error.message;
+
+    console.error(`[${formatLogTime()}] Gagal initialize WhatsApp client:`, error.message);
+  }
+}
+
+async function destroyClient() {
+  if (!client) {
+    return;
   }
 
-  console.log("Scan QR ini:");
-  qrcodeTerminal.generate(qr, { small: true });
-});
+  const oldClient = client;
+  client = null;
 
-client.on("authenticated", () => {
-  console.log("WhatsApp authenticated");
-});
+  try {
+    oldClient.removeAllListeners();
+  } catch (error) {}
 
-client.on("auth_failure", (message) => {
-  isReady = false;
-  clientInfo = null;
-
-  console.error("WhatsApp auth failure:", message);
-});
-
-client.on("ready", () => {
-  isReady = true;
-  lastQr = null;
-  lastQrImage = null;
-  lastQrGeneratedAt = null;
-  clientInfo = client.info;
-
-  console.log("WhatsApp siap digunakan!");
-});
-
-client.on("message", async (msg) => {
-  console.log(`Pesan masuk: ${msg.from} ${msg.body}`);
-
-  if (msg.body === "!ping") {
-    const replyMessage = await msg.reply("Kamu jelek 🤪");
-
-    console.log(
-      `Pesan keluar: ${replyMessage.from} -> ${replyMessage.to} ${replyMessage.body}`
-    );
+  try {
+    await oldClient.destroy();
+  } catch (error) {
+    console.log(`[${formatLogTime()}] Destroy skipped:`, error.message);
   }
-});
+}
 
-client.on("disconnected", (reason) => {
-  isReady = false;
-  clientInfo = null;
+async function deleteSessionFolder() {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      if (fs.existsSync(SESSION_CLIENT_PATH)) {
+        fs.rmSync(SESSION_CLIENT_PATH, {
+          recursive: true,
+          force: true,
+        });
+      }
 
-  console.log("WhatsApp disconnected:", reason);
-});
+      return;
+    } catch (error) {
+      if (attempt === 5) {
+        throw error;
+      }
 
-client.on("change_state", (state) => {
-  console.log("WhatsApp state:", state);
-});
+      await sleep(500);
+    }
+  }
+}
 
 app.get("/", (req, res) => {
   res.json({
@@ -118,10 +231,9 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "/health",
       status: "/status",
-      qrJson: "/qr",
-      qrImage: "/qr-image",
-      qrView: "/qr-view",
+      qr: "/qr",
       sendMessage: "/send-message",
+      endSession: "/end-session",
     },
   });
 });
@@ -131,7 +243,8 @@ app.get("/health", (req, res) => {
     success: true,
     message: "WhatsApp Gateway aktif",
     ready: isReady,
-    sessionId: WA_SESSION_ID,
+    initializing: isInitializing,
+    lastError,
   });
 });
 
@@ -139,7 +252,9 @@ app.get("/status", async (req, res) => {
   let state = null;
 
   try {
-    state = await client.getState();
+    if (client) {
+      state = await client.getState();
+    }
   } catch (error) {
     state = null;
   }
@@ -147,8 +262,11 @@ app.get("/status", async (req, res) => {
   res.json({
     success: true,
     ready: isReady,
+    initializing: isInitializing,
     state,
-    sessionId: WA_SESSION_ID,
+    hasQr: Boolean(lastQrSvg),
+    generatedAt: lastQrGeneratedAt,
+    lastError,
     info: clientInfo
       ? {
           wid: clientInfo.wid?._serialized || null,
@@ -160,194 +278,35 @@ app.get("/status", async (req, res) => {
 });
 
 app.get("/qr", (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+
   if (isReady) {
-    return res.json({
+    return res.status(200).json({
       success: true,
       ready: true,
-      message: "WhatsApp sudah terhubung",
-      sessionId: WA_SESSION_ID,
-      qr: null,
-      qrImage: null,
+      message: "WhatsApp sudah siap digunakan.",
+      svg: "",
       generatedAt: null,
     });
   }
 
-  if (!lastQr || !lastQrImage) {
-    return res.json({
-      success: true,
+  if (!lastQr || !lastQrSvg) {
+    return res.status(404).json({
+      success: false,
       ready: false,
       message: "QR belum tersedia. Tunggu beberapa detik lalu refresh.",
-      sessionId: WA_SESSION_ID,
-      qr: null,
-      qrImage: null,
+      svg: "",
       generatedAt: null,
     });
   }
 
-  res.json({
+  res.status(200).json({
     success: true,
     ready: false,
-    message: "Silakan scan QR",
-    sessionId: WA_SESSION_ID,
-    qr: lastQr,
-    qrImage: lastQrImage,
+    message: "QR tersedia. Silakan scan QR.",
+    svg: lastQrSvg,
     generatedAt: lastQrGeneratedAt,
   });
-});
-
-app.get("/qr-image", (req, res) => {
-  if (isReady) {
-    return res.status(200).send("WhatsApp sudah terhubung");
-  }
-
-  if (!lastQrImage) {
-    return res.status(404).send("QR belum tersedia. Tunggu beberapa detik lalu refresh.");
-  }
-
-  const base64Data = lastQrImage.replace(/^data:image\/png;base64,/, "");
-  const imageBuffer = Buffer.from(base64Data, "base64");
-
-  res.setHeader("Content-Type", "image/png");
-  res.send(imageBuffer);
-});
-
-app.get("/qr-view", (req, res) => {
-  if (isReady) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="id">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>WhatsApp Connected</title>
-        <style>
-          body {
-            font-family: Arial, sans-serif;
-            background: #f1f5f9;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            margin: 0;
-          }
-          .card {
-            background: white;
-            padding: 32px;
-            border-radius: 20px;
-            text-align: center;
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-          }
-          .success {
-            color: #16a34a;
-            font-size: 22px;
-            font-weight: bold;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <div class="success">WhatsApp sudah terhubung ✅</div>
-          <p>Session: ${WA_SESSION_ID}</p>
-        </div>
-      </body>
-      </html>
-    `);
-  }
-
-  if (!lastQrImage) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="id">
-      <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <meta http-equiv="refresh" content="5" />
-        <title>QR Belum Tersedia</title>
-        <style>
-          body {
-            font-family: Arial, sans-serif;
-            background: #f1f5f9;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            margin: 0;
-          }
-          .card {
-            background: white;
-            padding: 32px;
-            border-radius: 20px;
-            text-align: center;
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-          }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h2>QR belum tersedia</h2>
-          <p>Tunggu beberapa detik. Halaman akan refresh otomatis.</p>
-        </div>
-      </body>
-      </html>
-    `);
-  }
-
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="id">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <meta http-equiv="refresh" content="20" />
-      <title>Scan WhatsApp QR</title>
-      <style>
-        body {
-          font-family: Arial, sans-serif;
-          background: #f1f5f9;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          min-height: 100vh;
-          margin: 0;
-        }
-        .card {
-          background: white;
-          padding: 32px;
-          border-radius: 20px;
-          text-align: center;
-          box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-        }
-        img {
-          width: 280px;
-          height: 280px;
-          border-radius: 16px;
-          border: 1px solid #e2e8f0;
-        }
-        h1 {
-          margin-bottom: 8px;
-          color: #0f172a;
-        }
-        p {
-          color: #64748b;
-        }
-        .session {
-          margin-top: 16px;
-          font-size: 13px;
-          color: #94a3b8;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>Scan WhatsApp QR</h1>
-        <p>Buka WhatsApp di HP lalu scan QR ini.</p>
-        <img src="${lastQrImage}" alt="WhatsApp QR" />
-        <div class="session">Session: ${WA_SESSION_ID}</div>
-        <div class="session">Generated at: ${lastQrGeneratedAt}</div>
-      </div>
-    </body>
-    </html>
-  `);
 });
 
 app.post("/send-message", async (req, res) => {
@@ -361,7 +320,7 @@ app.post("/send-message", async (req, res) => {
       });
     }
 
-    if (!isReady) {
+    if (!isReady || !client) {
       return res.status(503).json({
         success: false,
         message: "WhatsApp belum siap. Scan QR dulu.",
@@ -371,6 +330,10 @@ app.post("/send-message", async (req, res) => {
     const chatId = formatNumber(number);
 
     const sentMessage = await client.sendMessage(chatId, message);
+
+    console.log(
+      `[${formatLogTime()}] Pesan keluar API: ${sentMessage.from} -> ${sentMessage.to} ${sentMessage.body}`
+    );
 
     res.json({
       success: true,
@@ -386,7 +349,7 @@ app.post("/send-message", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Gagal kirim pesan:", error);
+    console.error(`[${formatLogTime()}] Gagal kirim pesan:`, error);
 
     res.status(500).json({
       success: false,
@@ -396,7 +359,58 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-client.initialize();
+app.post("/end-session", async (req, res) => {
+  try {
+    isReady = false;
+    isInitializing = false;
+    lastQr = null;
+    lastQrSvg = null;
+    lastQrGeneratedAt = null;
+    clientInfo = null;
+    lastError = null;
+
+    if (client) {
+      try {
+        await client.logout();
+        console.log(`[${formatLogTime()}] WhatsApp session logged out`);
+      } catch (error) {
+        console.log(`[${formatLogTime()}] Logout skipped:`, error.message);
+      }
+
+      await destroyClient();
+    }
+
+    await sleep(1000);
+    await deleteSessionFolder();
+
+    console.log(`[${formatLogTime()}] WhatsApp session folder deleted`);
+
+    initializeClient();
+
+    res.json({
+      success: true,
+      message: "WhatsApp session berhasil diakhiri. QR baru akan dibuat.",
+      ready: false,
+      initializing: true,
+      svg: "",
+      generatedAt: null,
+    });
+  } catch (error) {
+    isReady = false;
+    isInitializing = false;
+    lastError = error.message;
+
+    console.error(`[${formatLogTime()}] Gagal end session:`, error.message);
+
+    res.status(500).json({
+      success: false,
+      message: "Gagal end session",
+      error: error.message,
+    });
+  }
+});
 
 app.listen(PORT, "127.0.0.1", () => {
+  console.log(`WhatsApp Gateway running on http://127.0.0.1:${PORT}`);
+  initializeClient();
 });

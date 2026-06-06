@@ -1,0 +1,198 @@
+name: 🚀 Deploy WA Gateway Node.js to cPanel
+
+on:
+    push:
+        branches:
+            - main
+
+jobs:
+    deploy-wa-gateway:
+        name: 🟢 Deploy WA Gateway to cPanel Node App
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: 📦 Checkout Repository
+              uses: actions/checkout@v4
+
+            - name: ⚙️ Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+                  cache: 'npm'
+
+            - name: 📥 Install Dependencies for Validation
+              run: |
+                  echo "🚀 Installing dependencies locally for validation..."
+                  npm ci
+                  echo "✅ Local dependencies installed successfully!"
+
+            - name: 🔍 Validate Project Files
+              run: |
+                  echo "🔎 Checking required project files..."
+
+                  if [ ! -f "package.json" ]; then
+                    echo "❌ package.json not found!"
+                    exit 1
+                  fi
+
+                  if [ ! -f "server.js" ]; then
+                    echo "❌ server.js not found!"
+                    echo "💡 If your startup file is app.js, change STARTUP_FILE in workflow."
+                    exit 1
+                  fi
+
+                  echo "✅ Required files found!"
+
+            - name: 🔐 Install SSH Deployment Tools
+              run: |
+                  echo "🔧 Preparing deployment tools..."
+                  sudo apt-get update
+                  sudo apt-get install -y sshpass jq
+                  echo "✅ sshpass and jq are ready!"
+
+            - name: 🧩 Parse Deployment Config
+              env:
+                  DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+              run: |
+                  echo "🔍 Reading deployment configuration..."
+
+                  echo "DEPLOY_HOST=$(echo "$DEPLOY_CONFIG" | jq -r '.HOST')" >> $GITHUB_ENV
+                  echo "DEPLOY_USER=$(echo "$DEPLOY_CONFIG" | jq -r '.USER')" >> $GITHUB_ENV
+                  echo "DEPLOY_PORT=$(echo "$DEPLOY_CONFIG" | jq -r '.PORT // "22"')" >> $GITHUB_ENV
+
+                  # Optional: isi kalau node/npm di hosting harus pakai path khusus
+                  # contoh: /opt/cpanel/ea-nodejs22/bin
+                  echo "DEPLOY_NODE_PATH=$(echo "$DEPLOY_CONFIG" | jq -r '.NODE_PATH // ""')" >> $GITHUB_ENV
+
+                  echo "DEPLOY_TARGET=cms.imnanang.my.id" >> $GITHUB_ENV
+                  echo "STARTUP_FILE=server.js" >> $GITHUB_ENV
+
+                  echo "✅ Deployment config parsed successfully!"
+                  echo "📂 Target folder: cms.imnanang.my.id"
+                  echo "🚀 Startup file: server.js"
+
+            - name: 🚀 Upload Node.js App to cPanel
+              env:
+                  DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+              run: |
+                  set -e
+
+                  echo "🔐 Preparing secure SSH password..."
+                  export SSHPASS=$(echo "$DEPLOY_CONFIG" | jq -r '.PASSWORD')
+                  echo "::add-mask::$SSHPASS"
+
+                  echo "🌐 Connecting to cPanel server..."
+                  echo "📡 Host: $DEPLOY_HOST"
+                  echo "👤 User: $DEPLOY_USER"
+                  echo "🔌 Port: $DEPLOY_PORT"
+                  echo "📁 Remote target: $DEPLOY_TARGET"
+
+                  echo "🧹 Preparing remote folder without deleting WhatsApp sessions..."
+                  sshpass -e ssh \
+                    -p "$DEPLOY_PORT" \
+                    -o StrictHostKeyChecking=no \
+                    "$DEPLOY_USER@$DEPLOY_HOST" \
+                    "TARGET_DIR=\"\$HOME/$DEPLOY_TARGET\"; \
+                     mkdir -p \"\$TARGET_DIR\"; \
+                     mkdir -p \"\$TARGET_DIR/sessions\"; \
+                     mkdir -p \"\$TARGET_DIR/tmp\"; \
+                     mkdir -p \"\$TARGET_DIR/logs\"; \
+                     find \"\$TARGET_DIR\" -mindepth 1 -maxdepth 1 \
+                       ! -name 'sessions' \
+                       ! -name '.env' \
+                       ! -name 'tmp' \
+                       ! -name 'logs' \
+                       -exec rm -rf {} +"
+
+                  echo "✅ Remote folder prepared."
+                  echo "📦 Compressing Node.js source files..."
+
+                  tar \
+                    --exclude=".git" \
+                    --exclude=".github" \
+                    --exclude="node_modules" \
+                    --exclude=".env" \
+                    --exclude="sessions" \
+                    --exclude="tmp" \
+                    --exclude="logs" \
+                    -czf - . | sshpass -e ssh \
+                    -p "$DEPLOY_PORT" \
+                    -o StrictHostKeyChecking=no \
+                    "$DEPLOY_USER@$DEPLOY_HOST" \
+                    "tar -xzf - -C \"\$HOME/$DEPLOY_TARGET\""
+
+                  echo "✅ Source files uploaded successfully!"
+
+            - name: 📥 Install Production Dependencies on cPanel
+              env:
+                  DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+              run: |
+                  set -e
+
+                  export SSHPASS=$(echo "$DEPLOY_CONFIG" | jq -r '.PASSWORD')
+                  echo "::add-mask::$SSHPASS"
+
+                  echo "📦 Installing production dependencies on remote server..."
+
+                  sshpass -e ssh \
+                    -p "$DEPLOY_PORT" \
+                    -o StrictHostKeyChecking=no \
+                    "$DEPLOY_USER@$DEPLOY_HOST" \
+                    "set -e; \
+                     TARGET_DIR=\"\$HOME/$DEPLOY_TARGET\"; \
+                     cd \"\$TARGET_DIR\"; \
+                     if [ -n \"$DEPLOY_NODE_PATH\" ]; then export PATH=\"$DEPLOY_NODE_PATH:\$PATH\"; fi; \
+                     echo \"Node version:\"; node -v; \
+                     echo \"NPM version:\"; npm -v; \
+                     npm install --omit=dev; \
+                     echo \"✅ Production dependencies installed.\""
+
+            - name: 🔎 Check Chromium / Chrome Availability
+              env:
+                  DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+              run: |
+                  set -e
+
+                  export SSHPASS=$(echo "$DEPLOY_CONFIG" | jq -r '.PASSWORD')
+                  echo "::add-mask::$SSHPASS"
+
+                  echo "🔎 Checking Chrome/Chromium on remote server..."
+
+                  sshpass -e ssh \
+                    -p "$DEPLOY_PORT" \
+                    -o StrictHostKeyChecking=no \
+                    "$DEPLOY_USER@$DEPLOY_HOST" \
+                    "echo 'Checking browser path...'; \
+                     which google-chrome || true; \
+                     which google-chrome-stable || true; \
+                     which chromium || true; \
+                     which chromium-browser || true; \
+                     google-chrome --version || true; \
+                     google-chrome-stable --version || true; \
+                     chromium --version || true; \
+                     chromium-browser --version || true; \
+                     echo '✅ Browser check completed.'"
+
+            - name: 🔄 Restart cPanel Node.js App
+              env:
+                  DEPLOY_CONFIG: ${{ secrets.DEPLOY_CONFIG }}
+              run: |
+                  set -e
+
+                  export SSHPASS=$(echo "$DEPLOY_CONFIG" | jq -r '.PASSWORD')
+                  echo "::add-mask::$SSHPASS"
+
+                  echo "🔄 Restarting Node.js app using Passenger restart file..."
+
+                  sshpass -e ssh \
+                    -p "$DEPLOY_PORT" \
+                    -o StrictHostKeyChecking=no \
+                    "$DEPLOY_USER@$DEPLOY_HOST" \
+                    "TARGET_DIR=\"\$HOME/$DEPLOY_TARGET\"; \
+                     cd \"\$TARGET_DIR\"; \
+                     mkdir -p tmp; \
+                     touch tmp/restart.txt; \
+                     echo \"✅ Restart signal sent.\""
+
+                  echo "🎉 Deployment completed successfully!"
+                  echo "🌍 Live target: https://cms.imnanang.my.id"
